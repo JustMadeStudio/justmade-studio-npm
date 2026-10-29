@@ -321,8 +321,9 @@ export class JustmadeClient {
    * served straight from cache, zero network. After a content change the stamp
    * moves, so the entry is revalidated once with `If-None-Match` - a `304` keeps
    * the cached value, a `200` replaces it - and then it is fast again. If the
-   * studio is unreachable, the last good value is served rather than failing
-   * (unless it is a definitive 4xx like a deleted record).
+   * studio is unreachable, the last good value is served rather than failing,
+   * even once its TTL has run out (unless it is a definitive 4xx like a deleted
+   * record).
    */
   private async cachedGet<T>(cacheKey: string, path: string, opts?: ReadOptions): Promise<T> {
     const useCache = opts?.cache ?? this.readDefault
@@ -347,31 +348,38 @@ export class JustmadeClient {
       if (version === undefined || entry.validatedVersion === version) {
         return entry.value as T
       }
-      // The stamp moved: revalidate just this entry against the studio.
-      try {
-        const res = await this.conditionalGet(path, entry.etag)
-        if (res.notModified) {
-          this.cache.confirm(cacheKey, version, Date.now())
-          return entry.value as T
-        }
-        this.cache.set(cacheKey, res.value, { etag: res.etag, version }, Date.now())
-        return res.value as T
-      }
-      catch (err) {
-        // Definitive answer (deleted/forbidden): drop the entry and surface it.
-        // Transient (studio down, 5xx, network): serve the last good value.
-        if (err instanceof JustmadeError && err.status < 500) {
-          this.cache.delete(cacheKey)
-          throw err
-        }
-        return entry.value as T
-      }
     }
 
-    // Cache miss: fetch fresh. Nothing to fall back to, so errors propagate.
-    const res = await this.conditionalGet(path)
-    this.cache.set(cacheKey, res.value, { etag: res.etag, version }, Date.now())
-    return res.value as T
+    // Revalidate (the stamp moved) or refetch (miss / TTL expired). An expired
+    // entry still has its etag, so an unchanged value comes back as a `304`.
+    const last = entry ?? this.cache.stale(cacheKey)
+    // A refetch failed moments ago: serve the last good value until the pause
+    // is over, rather than making every read wait on an unreachable studio.
+    if (last?.retryAt !== undefined && Date.now() < last.retryAt) {
+      return last.value as T
+    }
+    try {
+      const res = await this.conditionalGet(path, last?.etag)
+      if (res.notModified && last) {
+        this.cache.confirm(cacheKey, version, Date.now())
+        return last.value as T
+      }
+      this.cache.set(cacheKey, res.value, { etag: res.etag, version }, Date.now())
+      return res.value as T
+    }
+    catch (err) {
+      // Definitive answer (deleted/forbidden): drop the entry and surface it.
+      if (err instanceof JustmadeError && !isTransientStatus(err.status)) {
+        this.cache.delete(cacheKey)
+        throw err
+      }
+      // Transient (studio down, 5xx, timeout, rate limit, network): serve the
+      // last good value, even an expired one. With nothing cached at all, the
+      // error propagates - but leaves the cache alone, as a concurrent read may
+      // have filled it since.
+      if (!last) throw err
+      return this.cache.backoff(cacheKey, last, Date.now()).value as T
+    }
   }
 
   /**
@@ -493,6 +501,14 @@ export function isPreviewRequest(input: PreviewInput): boolean {
 }
 
 // ── Cache-key + path helpers ──────────────────────────────────────────────────
+
+/**
+ * Whether an error status says "try again later" rather than "this is the
+ * answer": server errors, request timeout (408) and rate limiting (429).
+ */
+function isTransientStatus(status: number): boolean {
+  return status >= 500 || status === 408 || status === 429
+}
 
 function datasetPath(nodeSlug: string, datasetSlug: string): string {
   return `/nodes/${encodeURIComponent(nodeSlug)}/datasets/${encodeURIComponent(datasetSlug)}/records`

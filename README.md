@@ -172,26 +172,31 @@ What this buys you:
   10 minutes". No button, no
   webhook, no cache to clear.
 - **Resilient:** if the studio is unreachable, the last good value keeps being
-  served (a definitive `404`/`403`, e.g. a deleted record, is surfaced as an
-  error rather than masked).
-- The **TTL (7 days default)** is the outage window, not the refresh interval:
-  how long the site keeps serving the last-known content while the studio is
-  unreachable. An entry that keeps revalidating stays alive, so in practice an
-  entry only expires ~`ttl` after the studio goes down.
+  served for as long as the outage lasts, even past its TTL. That includes a
+  `5xx`, `408` or `429`; any other `4xx` (e.g. a `404` for a deleted record,
+  or a `401`/`403`) is definitive and surfaced as an error rather than masked. Only a read with nothing cached fails, as does a preview or
+  `cache: false` read, which never falls back. After a failed attempt an
+  entry waits one `revalidate` interval (1 minute if revalidation is off)
+  before trying again, so reads don't each wait on the unreachable studio.
+- The **TTL (7 days default)** is not the refresh interval either: it is how
+  long an entry is served without asking the studio when the stamp gives no
+  reason to. After that the next read refetches it (a `304` if nothing
+  changed), and if the studio is down it falls back to the expired value.
 
 Every knob is overridable:
 
 ```ts
 const studio = createClient({
   apiKey, baseUrl,
-  // defaults: ttl 7d (outage window), revalidate 60s (stamp check), maxEntries 500
+  // defaults: ttl 7d, revalidate 60s (stamp check), maxEntries 500
   cache: { ttl: 604_800_000, revalidate: 60_000, maxEntries: 1000 },
 })
 
-// Survive an outage of any length - serve last-known until the studio returns:
+// Never expire - only a stamp change makes an entry ask the studio again:
 createClient({ apiKey, baseUrl, cache: { ttl: 0 } })
 
-// Pure TTL, never check the stamp (content can be up to `ttl` stale):
+// Pure TTL, never check the stamp (content can be up to `ttl` stale while the
+// studio is reachable; during an outage the last good value is served):
 createClient({ apiKey, baseUrl, cache: { revalidate: false } })
 
 // Disable caching entirely (every read hits the studio live):

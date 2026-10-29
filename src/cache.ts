@@ -24,6 +24,12 @@ export interface CacheEntry {
   validatedVersion?: string
   /** Epoch ms when the entry expires. `0` means it never expires. */
   expiresAt: number
+  /**
+   * Epoch ms before which a failed refetch is not retried: until then the entry
+   * is served as-is. Set after a transient error, cleared by a fresh value or a
+   * `304`.
+   */
+  retryAt?: number
 }
 
 /** Pluggable backing store. The default is an in-memory, insertion-ordered map. */
@@ -44,14 +50,14 @@ export interface CacheOptions {
    *
    * This is NOT how long until content refreshes - revalidation keeps entries
    * current within `revalidate` (seconds) whenever the studio is reachable. The
-   * TTL is really the outage window: how long the site keeps serving the
-   * last-known content while the studio is unreachable, before an entry is
-   * dropped and a read must hit the network again. A generous default so a
-   * studio outage degrades to "slightly stale" rather than "site errors".
+   * TTL only decides when an entry stops being served blindly and the next read
+   * must refetch it. If that refetch fails transiently (studio down, 5xx,
+   * network), the expired value is served anyway, so a studio outage degrades
+   * to "slightly stale" rather than "site errors" however long it lasts.
    *
    * The one case where it bounds staleness directly is when revalidation is off
    * (`revalidate: false`) or the server has no `/version` endpoint: then content
-   * can be up to `ttl` old. `0` = never expire.
+   * can be up to `ttl` old while the studio is reachable. `0` = never expire.
    */
   ttl?: number
   /**
@@ -115,11 +121,14 @@ export class MemoryCacheStore implements CacheStore {
 export class ContentCache {
   readonly enabled: boolean
   private ttl: number
+  /** Pause after a failed refetch: the `revalidate` interval, or 1 minute without one. */
+  private retryDelay: number
   private store: CacheStore
 
   constructor(opts: CacheOptions = {}) {
     this.enabled = opts.enabled ?? true
     this.ttl = opts.ttl ?? 604_800_000
+    this.retryDelay = typeof opts.revalidate === 'number' && opts.revalidate > 0 ? opts.revalidate : 60_000
     this.store = opts.store ?? new MemoryCacheStore(opts.maxEntries ?? 500)
   }
 
@@ -127,16 +136,24 @@ export class ContentCache {
    * The live entry for `key`, or `undefined` on miss / TTL expiry. Returns the
    * whole entry (value + etag + validated stamp) so the client can decide
    * whether to serve it, revalidate it, or fall back to it on error.
+   *
+   * An expired entry is left in the store (the refetch overwrites it, or
+   * `maxEntries` evicts it) so `stale` can still fall back to it.
    */
   peek(key: string, now: number): CacheEntry | undefined {
-    if (!this.enabled) return undefined
-    const entry = this.store.get(key)
+    const entry = this.stale(key)
     if (!entry) return undefined
-    if (entry.expiresAt !== 0 && entry.expiresAt <= now) {
-      this.store.delete(key)
-      return undefined
-    }
+    if (entry.expiresAt !== 0 && entry.expiresAt <= now) return undefined
     return entry
+  }
+
+  /**
+   * The entry for `key` whether or not its TTL has run out: the last good value
+   * to serve when a refetch fails transiently.
+   */
+  stale(key: string): CacheEntry | undefined {
+    if (!this.enabled) return undefined
+    return this.store.get(key)
   }
 
   /** Store a freshly fetched value with its validator and the stamp it is current against. */
@@ -159,7 +176,24 @@ export class ContentCache {
     if (!entry) return
     entry.validatedVersion = version
     entry.expiresAt = this.ttl === 0 ? 0 : now + this.ttl
+    delete entry.retryAt
     this.store.set(key, entry)
+  }
+
+  /**
+   * Record that refetching `key` from `from` just failed transiently, so reads
+   * serve it as-is for a while instead of each waiting on an unreachable studio.
+   * Returns the entry to serve: `from`, or the newer one a concurrent read stored
+   * in the meantime (left unpaused, since its own fetch succeeded).
+   */
+  backoff(key: string, from: CacheEntry, now: number): CacheEntry {
+    const entry = this.store.get(key)
+    if (!entry) return from
+    // Compare fields, not identity: a custom store may hand back copies.
+    if (entry.etag !== from.etag || entry.expiresAt !== from.expiresAt) return entry
+    entry.retryAt = now + this.retryDelay
+    this.store.set(key, entry)
+    return entry
   }
 
   /** Drop one exact key. */

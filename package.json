@@ -1,6 +1,6 @@
 {
   "name": "@justmade/client",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Typed client for the Justmade Studio content API. Read and write project node datasets from any website or app, headless-CMS style and beyond.",
   "type": "module",
   "publishConfig": {
