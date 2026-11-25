@@ -873,6 +873,18 @@ describe('requested locales', () => {
     assert.equal(await read(plain, { locale: 'de-DE' }), 'one')
   })
 
+  test('a project without locales has one entry, whatever language is asked for', async () => {
+    // What the real studio answers for such a project: an empty list, and the
+    // same content for every requested language as for none.
+    studio.locales = []
+    const client = createClient({ apiKey: 'k', baseUrl })
+    for (const locale of ['nl-BE', 'nl', 'en', 'de-DE', 'x1-ZZ']) {
+      assert.equal(await read(client, { locale }), 'one', `asked for "${locale}"`)
+    }
+    assert.deepEqual(recordRequests().map((u) => u.split('?')[1]), [undefined])
+    assert.equal(studio.hits.filter((u) => u.endsWith('/locales')).length, 1)
+  })
+
   test('hundreds of made-up locales cannot push content out of the cache', async () => {
     // What a crawler sending arbitrary Accept-Language values does to a site
     // that passes the header on. Ten entries is all this cache holds.

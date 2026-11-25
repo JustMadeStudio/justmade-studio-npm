@@ -325,7 +325,9 @@ export class JustmadeClient {
 
   /**
    * The project's locales, or `undefined` when they have never been read and
-   * cannot be now.
+   * cannot be now. An empty list is an answer like any other: the project has
+   * no locales, the studio serves the same content whatever language is asked
+   * for, and `matchLocale` then maps every request onto the default.
    *
    * Once the list is known this does not wait for anything: the read maps from
    * the list as it stands, and the list is brought up to date on the side. A
@@ -345,14 +347,14 @@ export class JustmadeClient {
       // localized read, and a new locale shows up when the stamp moves.
       const lookup = this.locales({ cache: true }).then(
         (locales) => {
-          state.locales = locales.length > 0 ? locales : undefined
+          state.locales = locales
         },
         () => {
           // Leave the list as it is, and the studio alone for a while.
           state.localesRetryAt = Date.now() + LOCALES_RETRY_MS
         },
       )
-      if (!state.locales || this.waitForFresh === Infinity) await lookup
+      if (state.locales === undefined || this.waitForFresh === Infinity) await lookup
     }
     return state.locales
   }

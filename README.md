@@ -115,7 +115,8 @@ locales (by the rule below, from `locales()`) before it asks or caches. So
 `nl`, `nl-NL` and `nl-BE` share one entry and one request, and a visitor - or a
 crawler - sending hundreds of different languages cannot push your content out
 of the cache. The client keeps the list of locales it last read, so this keeps
-working while the studio is away.
+working while the studio is away. A project without any locales has one entry
+per read: the requested language is left out, as the studio ignores it there.
 
 ### How a requested locale resolves
 
