@@ -73,11 +73,29 @@ export interface CacheOptions {
    * and leaves you with pure TTL expiry.
    */
   revalidate?: number | false
+  /**
+   * How long a read that already holds a cached value waits on the studio for a
+   * fresher one, in ms. Default `1000`. Past it the read gets the cached value
+   * and the refresh finishes in the background, so the next read has it.
+   *
+   * It keeps a slow or hanging studio from slowing your pages down: without it
+   * every read after an edit waits for as long as the studio takes, up to
+   * `timeout`. The price is that on a slow studio an edit shows one read later.
+   *
+   * `0` never waits (always serve the cached value, refresh in the background).
+   * `false` waits for the studio; choose it where work cannot outlive the
+   * request, as on serverless platforms that freeze the process once the
+   * response is out. A read with nothing cached always waits.
+   */
+  waitForFresh?: number | false
   /** Soft cap on entries; oldest are evicted first. Default `500`. */
   maxEntries?: number
   /** Custom backing store. Defaults to an in-memory store. */
   store?: CacheStore
 }
+
+/** An `expiresAt` that is always in the past (`0` would mean "never expires"). */
+const EXPIRED = 1
 
 /** In-memory store with insertion-order (FIFO) eviction once `maxEntries` is hit. */
 export class MemoryCacheStore implements CacheStore {
@@ -194,6 +212,28 @@ export class ContentCache {
     entry.retryAt = now + this.retryDelay
     this.store.set(key, entry)
     return entry
+  }
+
+  /**
+   * Mark `key` as due for a refetch while keeping its value to fall back on:
+   * the next read asks the studio again whatever the stamp says, and still
+   * serves this value if the studio does not answer. For when the stored value
+   * may be outdated but there is no telling - dropping it would throw away the
+   * only thing left to show during an outage. No-op for a key that is not held.
+   */
+  expire(key: string): void {
+    const entry = this.store.get(key)
+    if (!entry) return
+    entry.expiresAt = EXPIRED
+    delete entry.retryAt
+    this.store.set(key, entry)
+  }
+
+  /** `expire` for every key that starts with `prefix`. */
+  expirePrefix(prefix: string): void {
+    for (const key of [...this.store.keys()]) {
+      if (key.startsWith(prefix)) this.expire(key)
+    }
   }
 
   /** Drop one exact key. */

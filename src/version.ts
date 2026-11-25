@@ -16,7 +16,7 @@
 
 export type VersionProbe = () => Promise<string>
 
-/** How long a `404` from the version route silences the check. */
+/** How long a server without the version route silences the check. */
 export const UNSUPPORTED_PAUSE_MS = 15 * 60_000
 
 export class VersionTracker {
@@ -24,10 +24,10 @@ export class VersionTracker {
     private version: string | null = null
     private inFlight: Promise<void> | null = null
     /**
-     * Epoch ms before which we do not ask again, after the route answered `404`.
-     * A pause and not a final verdict: an old server without the route costs
-     * one request per pause, while a proxy or maintenance page that answers 404
-     * for a moment would otherwise switch freshness off until a restart.
+     * Epoch ms before which we do not ask again, after the server turned out
+     * to have no version route. A pause and not a final verdict: an old server
+     * costs one request per pause, and one that gains the route is picked up
+     * without a restart.
      */
     private pausedUntil = 0
 
@@ -35,6 +35,14 @@ export class VersionTracker {
         private readonly probe: VersionProbe,
         /** Minimum ms between two probes. `0` disables checking entirely. */
         private readonly interval: number,
+        /**
+         * Whether a probe failure means "this server has no version route", as
+         * opposed to "could not be reached". The caller decides, as only it can
+         * tell the server's own `404` from the one a proxy answers with while
+         * the server is away - and that one must not pause anything: the server
+         * is back in seconds, and freshness would stay off for the whole pause.
+         */
+        private readonly isUnsupported: (err: unknown) => boolean = (err) => (err as { status?: number } | null)?.status === 404,
     ) {}
 
     /** The most recent stamp seen, or `null` before the first successful probe. */
@@ -46,11 +54,16 @@ export class VersionTracker {
      * Refresh the stamp if we are due. Resolves once the answer is in, so the
      * read that triggered it sees an up-to-date stamp. A failed probe leaves the
      * last known stamp in place (serve-from-cache rather than thrash).
+     *
+     * A failed probe counts towards the interval like any other, also when no
+     * stamp has ever come in. Otherwise a process that starts while the studio
+     * is down (with a persisted cache to serve from) would probe on every read,
+     * and against a hanging studio make each of them wait out the probe.
      */
     async refresh(now: number): Promise<void> {
         if (this.interval <= 0 || now < this.pausedUntil) return
         if (this.inFlight) return this.inFlight
-        if (this.version !== null && now - this.lastChecked < this.interval) return
+        if (now - this.lastChecked < this.interval) return
 
         this.lastChecked = now
         this.inFlight = this.run(now)
@@ -67,10 +80,10 @@ export class VersionTracker {
             this.version = await this.probe()
         }
         catch (err) {
-            // A server that predates the version route answers 404: ask again
-            // only after a long pause. Any other failure is transient - keep the
-            // last stamp so the cache keeps serving, and try again next interval.
-            if ((err as { status?: number })?.status === 404) {
+            // A server that predates the version route: ask again only after a
+            // long pause. Any other failure is transient - keep the last stamp
+            // so the cache keeps serving, and try again next interval.
+            if (this.isUnsupported(err)) {
                 this.pausedUntil = now + Math.max(this.interval, UNSUPPORTED_PAUSE_MS)
             }
         }

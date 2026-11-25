@@ -21,7 +21,7 @@
  * include the project or the API key, so two sites sharing a directory would
  * serve each other's content while the studio is unreachable.
  */
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { CacheEntry, CacheStore } from './cache'
@@ -47,6 +47,23 @@ interface StoredFile {
 }
 
 const SUFFIX = '.json'
+
+/**
+ * The only names this store reads, replaces or removes: the sha256 of a cache
+ * key (see `fileOf`), and the temp file of a write to one. `dir` may hold other
+ * files - a mistyped path can point at a project root - and those are never
+ * touched, whatever their extension.
+ */
+const CACHE_FILE = /^[0-9a-f]{64}\.json$/
+const TEMP_FILE = /^[0-9a-f]{64}\.json\.\d+(\.[0-9a-f]+)?\.tmp$/
+
+/**
+ * How old a temp file must be before a starting store takes it for an orphan.
+ * A write takes milliseconds, so anything younger may be a write under way in
+ * another process on the same directory: the old and the new container during
+ * a redeploy, or the workers of a cluster.
+ */
+const TEMP_ORPHAN_MS = 60_000
 
 export class FileCacheStore implements CacheStore {
   private readonly dir: string
@@ -97,7 +114,7 @@ export class FileCacheStore implements CacheStore {
   clear(): void {
     this.map.clear()
     for (const name of this.list()) {
-      if (name.endsWith(SUFFIX)) this.remove(join(this.dir, name))
+      if (CACHE_FILE.test(name)) this.remove(join(this.dir, name))
     }
   }
 
@@ -114,19 +131,21 @@ export class FileCacheStore implements CacheStore {
       mkdirSync(this.dir, { recursive: true })
     }
     catch (err) {
-      this.onError(err)
+      this.fail(err)
       return
     }
 
     const found: { key: string, entry: CacheEntry, mtime: number }[] = []
     for (const name of this.list()) {
       const file = join(this.dir, name)
-      // Left behind by a process killed between write and rename.
-      if (name.endsWith('.tmp')) {
-        this.remove(file)
+      // Left behind by a process killed between write and rename - unless it
+      // is fresh, and then it belongs to a write that is still happening.
+      if (TEMP_FILE.test(name)) {
+        if (this.orphaned(file)) this.remove(file)
         continue
       }
-      if (!name.endsWith(SUFFIX)) continue
+      // Not one of ours: leave it exactly as it is.
+      if (!CACHE_FILE.test(name)) continue
       try {
         const stored = JSON.parse(readFileSync(file, 'utf8')) as StoredFile
         if (stored?.v !== 1 || typeof stored.key !== 'string' || !stored.entry || file !== this.fileOf(stored.key)) {
@@ -135,7 +154,8 @@ export class FileCacheStore implements CacheStore {
         found.push({ key: stored.key, entry: stored.entry, mtime: statSync(file).mtimeMs })
       }
       catch {
-        // Unreadable or foreign: it can only ever be a miss, so drop it.
+        // Ours by name but unreadable, or filed under another key: it can only
+        // ever be a miss, so drop it.
         this.remove(file)
       }
     }
@@ -152,7 +172,9 @@ export class FileCacheStore implements CacheStore {
   /** Temp file plus rename, so a reader (or a crash) never sees half a file. */
   private write(key: string, entry: CacheEntry): void {
     const file = this.fileOf(key)
-    const tmp = `${file}.${process.pid}.tmp`
+    // The random part keeps two processes apart that write the same key at the
+    // same moment. The pid alone does not: in a container it is 1 for both.
+    const tmp = `${file}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`
     try {
       const stored: StoredFile = { v: 1, key, entry }
       writeFileSync(tmp, JSON.stringify(stored))
@@ -160,7 +182,35 @@ export class FileCacheStore implements CacheStore {
     }
     catch (err) {
       this.remove(tmp)
-      this.onError(err)
+      this.fail(err)
+    }
+  }
+
+  /**
+   * Hands a disk problem to `onError`. Never throws and never leaves a rejection
+   * behind: this runs inside a cache write, which runs inside a read, and a
+   * hook that fails (or an `async` one whose own work fails) must not fail the
+   * read or stop the process over a cache that merely fell back to memory.
+   */
+  private fail(err: unknown): void {
+    try {
+      const outcome: unknown = this.onError(err)
+      if (typeof (outcome as { then?: unknown } | null | undefined)?.then === 'function') {
+        (outcome as PromiseLike<unknown>).then(undefined, () => {})
+      }
+    }
+    catch {
+      /* the hook's own problem */
+    }
+  }
+
+  /** Whether a temp file is old enough to have been abandoned. Unknown counts as "no". */
+  private orphaned(file: string): boolean {
+    try {
+      return Date.now() - statSync(file).mtimeMs > TEMP_ORPHAN_MS
+    }
+    catch {
+      return false
     }
   }
 
@@ -169,7 +219,7 @@ export class FileCacheStore implements CacheStore {
       rmSync(file, { force: true })
     }
     catch (err) {
-      this.onError(err)
+      this.fail(err)
     }
   }
 
@@ -178,7 +228,7 @@ export class FileCacheStore implements CacheStore {
       return readdirSync(this.dir)
     }
     catch (err) {
-      this.onError(err)
+      this.fail(err)
       return []
     }
   }

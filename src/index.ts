@@ -1,5 +1,5 @@
 export { JustmadeClient, DatasetHandle, DEFAULT_BASE_URL, PREVIEW_PARAM, isPreviewRequest } from './client'
-export type { JustmadeClientOptions, ReadOptions, PreviewInput } from './client'
+export type { JustmadeClientOptions, ReadOptions, PreviewInput, StudioFailure } from './client'
 export { JustmadeError } from './errors'
 export { ContentCache, MemoryCacheStore } from './cache'
 export type { CacheOptions, CacheStore, CacheEntry } from './cache'

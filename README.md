@@ -109,11 +109,19 @@ Each locale is cached separately, so switching languages never serves the wrong
 one. Pass `locale: ''` on a call to force the project default even when a
 client-level `locale` is set.
 
+The cache holds one entry per **configured** locale, not one per spelling a
+visitor's browser sends: the client maps the requested value onto the project's
+locales (by the rule below, from `locales()`) before it asks or caches. So
+`nl`, `nl-NL` and `nl-BE` share one entry and one request, and a visitor - or a
+crawler - sending hundreds of different languages cannot push your content out
+of the cache. The client keeps the list of locales it last read, so this keeps
+working while the studio is away.
+
 ### How a requested locale resolves
 
 You can pass the visitor's **detected** locale verbatim (e.g. from
-`Accept-Language`); the studio resolves it server-side, so you never have to map
-it to a configured code yourself:
+`Accept-Language`); it is resolved for you, so you never have to map it to a
+configured code yourself:
 
 1. **Exact match** first (`nl-BE` -> `nl-BE`).
 2. **Base-language match**: `nl` and `nl-NL` resolve to a configured `nl-BE`;
@@ -175,16 +183,33 @@ What this buys you:
   webhook, no cache to clear.
 - **Resilient:** if the studio is unreachable, the last good value keeps being
   served for as long as the outage lasts, even past its TTL. That includes a
-  `5xx`, `408` or `429`; any other `4xx` (e.g. a `404` for a deleted record,
-  or a `401`/`403`) is definitive and surfaced as an error rather than masked. Only a read with nothing cached fails, as does a preview or
+  `5xx`, `408` or `429`; any other `4xx` from the studio (e.g. a `404` for a
+  deleted record, or a `401`/`403`) is definitive and surfaced as an error
+  rather than masked. A `4xx` that is not the studio's own JSON error - the
+  `404` a proxy answers with while the studio container is gone - counts as
+  unreachable. Only a read with nothing cached fails, as does a preview or
   `cache: false` read, which never falls back. After a failed attempt an
   entry waits one `revalidate` interval (1 minute if revalidation is off)
   before trying again, so reads don't each wait on the unreachable studio.
 - **A studio that hangs** (accepts the connection, never answers) counts as
   unreachable too: every request gives up after `timeout` (10 seconds by
   default, body included), the stamp check after at most 3 seconds.
-- A `404` from the stamp route (an older server, or a proxy page in front of
-  the studio) pauses the stamp check for 15 minutes; it then tries again.
+- A studio without the stamp route (an older server, answering its own `404`)
+  pauses the stamp check for 15 minutes; it then tries again. A `404` from a
+  proxy in front of the studio is not that: it counts as unreachable and the
+  check runs again at the next interval.
+- **A slow studio does not slow your pages.** A read that already holds a
+  cached value waits at most `waitForFresh` (1 second by default) for a fresher
+  one, stamp check included; after that it serves what it holds and the refresh
+  finishes in the background. Reads of the same key that arrive together share
+  one request. Only a read with nothing cached waits for as long as the studio
+  takes.
+- **A `200` that is not the studio's** (a maintenance page answering with JSON
+  of its own) is rejected instead of cached, so it cannot replace the last good
+  value. With nothing cached it throws an `UnexpectedResponseError`.
+- **You can see it happen.** These failures never reach your code, so pass
+  `onError` to log or alert on them; without it the client writes one
+  `console.warn` per outage. See [Noticing an outage](#noticing-an-outage).
 - The **TTL (7 days default)** is not the refresh interval either: it is how
   long an entry is served without asking the studio when the stamp gives no
   reason to. After that the next read refetches it (a `304` if nothing
@@ -212,9 +237,50 @@ createClient({ apiKey, baseUrl, cache: false })
 // Bypass the cache for a single call (the fresh value still refreshes it):
 await studio.listRecords('blog', 'posts', { cache: false })
 
-// Give up on a request sooner (default 10s; 0 = wait as long as the runtime does):
+// Give up on a request sooner (default 10s; 0 or Infinity = wait as long as
+// the runtime does):
 createClient({ apiKey, baseUrl, timeout: 5_000 })
+
+// How long a read that holds a cached value waits for a fresher one (default
+// 1s). 0 = never wait, false = wait for the studio (up to `timeout`):
+createClient({ apiKey, baseUrl, cache: { waitForFresh: 250 } })
 ```
+
+The timeout covers writes too. A `createRecord` or `updateRecord` that rejects
+with a `TimeoutError` (or a network error) may still have reached the studio, so
+do not send it again blindly: you could store the record twice. Retry a write
+only on an error the studio answered with.
+
+After such a write the cached reads of its dataset are not trusted either: the
+next read asks the studio again, and keeps the cached value to fall back on if
+the studio turns out to be down. A write the studio refused (a `4xx`) leaves
+the cache as it is.
+
+On a serverless platform that freezes the process once the response is out, set
+`waitForFresh: false`: a refresh left running in the background would not get to
+finish there.
+
+### Noticing an outage
+
+While the studio is away the site keeps answering from the cache, and nothing
+in your code throws. `onError` is called for each failure the client absorbs
+that way:
+
+```ts
+const studio = createClient({
+  apiKey,
+  onError: ({ during, key, error }) => {
+    // during: 'stamp-check' | 'read'; key: the cache entry, for a read
+    logger.warn('studio unreachable, serving cached content', { during, key, error })
+  },
+})
+```
+
+It fires at most once per stamp check and once per cache entry per retry pause,
+so it is safe to alert from. It may be `async`; whatever it throws or rejects
+with is swallowed, so a logger or webhook that is down as well cannot fail a
+read or stop the process. Errors that are thrown to you anyway (a read with
+nothing cached, a write) are not repeated here.
 
 > Caching is safe to leave on everywhere, including local/dev frontends: because
 > every read revalidates against the stamp, a cached dev site is still always in
@@ -282,6 +348,8 @@ const studio = createClient({
 - Put `dir` on a volume that survives a redeploy (a container's temp dir does not).
 - One directory per site: cache keys do not include the project or the key, so
   two sites sharing one would show each other's content during an outage.
+- Give it a directory of its own. It only ever reads or removes its own files
+  (64 hex characters plus `.json`), so anything else in `dir` is left alone.
 - Reads are served from memory; the disk is only written on a change. A
   directory that cannot be written leaves the store working from memory, with
   one warning (or your own `onError`).
