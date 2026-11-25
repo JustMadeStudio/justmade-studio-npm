@@ -1,6 +1,6 @@
 {
   "name": "@justmade/client",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "description": "Typed client for the Justmade Studio content API. Read and write project node datasets from any website or app, headless-CMS style and beyond.",
   "type": "module",
   "publishConfig": {
@@ -31,7 +31,7 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node --test test/",
+    "test": "npm run build && node --test \"test/*.test.mjs\"",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
