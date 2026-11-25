@@ -13,6 +13,11 @@ export const PREVIEW_PARAM = 'sl-preview'
 /** Hosted Justmade Studio platform. Used when no `baseUrl` is provided. */
 export const DEFAULT_BASE_URL = 'https://studio.justmade.be'
 
+/** Default request timeout in ms (`timeout` option). */
+const DEFAULT_TIMEOUT = 10_000
+/** Ceiling for the stamp check, which every concurrent read waits on. */
+const VERSION_TIMEOUT = 3_000
+
 export interface JustmadeClientOptions {
   /**
    * Project API key, `slk_...`. Mint one in the project's settings under
@@ -36,6 +41,17 @@ export interface JustmadeClientOptions {
   cache?: boolean | CacheOptions
   /** Custom `fetch` implementation. Defaults to the global `fetch`. */
   fetch?: typeof fetch
+  /**
+   * Give up on a request after this many ms, body included. Default `10000`.
+   * `0` disables it.
+   *
+   * Without one, a studio that accepts the connection but never answers holds
+   * every read until the runtime gives up (minutes, in Node). A timed-out read
+   * counts as transient, like a `5xx`: the last good value is served. The
+   * once-a-minute stamp check uses at most 3 seconds of it, as every read in
+   * that moment waits on the check.
+   */
+  timeout?: number
   /** Extra headers merged into every request. */
   headers?: Record<string, string>
   /**
@@ -82,6 +98,8 @@ export class JustmadeClient {
   private readDefault: boolean
   /** Client-level default locale for reads (undefined = project default). */
   private readonly locale?: string
+  /** Request timeout in ms, `0` for none. */
+  private readonly timeout: number
 
   constructor(options: JustmadeClientOptions) {
     if (!options.apiKey) throw new Error('JustmadeClient: `apiKey` is required')
@@ -96,6 +114,7 @@ export class JustmadeClient {
     this.headers = options.headers ?? {}
     this.locale = options.locale || undefined
     this.readDefault = options.preview !== true
+    this.timeout = options.timeout !== undefined && options.timeout >= 0 ? options.timeout : DEFAULT_TIMEOUT
 
     const cacheOpt = options.cache
     const cacheOptions: CacheOptions
@@ -107,8 +126,11 @@ export class JustmadeClient {
     const revalidate = cacheOptions.enabled === false || cacheOptions.revalidate === false
       ? 0
       : cacheOptions.revalidate ?? 60_000
+    // The stamp check is tiny, and every read arriving while it runs waits on it,
+    // so it gets a tighter budget than a full read.
+    const probeTimeout = this.timeout === 0 ? VERSION_TIMEOUT : Math.min(this.timeout, VERSION_TIMEOUT)
     this.versionTracker = new VersionTracker(
-      async () => (await this.request<{ version: string }>('GET', '/version')).version,
+      async () => (await this.request<{ version: string }>('GET', '/version', undefined, probeTimeout)).version,
       revalidate,
     )
   }
@@ -146,6 +168,7 @@ export class JustmadeClient {
       fetch: this.fetchImpl,
       headers: this.headers,
       locale: this.locale,
+      timeout: this.timeout,
       preview: true,
     })
     // Share the cache and the version tracker: the preview must refresh what the
@@ -390,36 +413,44 @@ export class JustmadeClient {
     path: string,
     ifNoneMatch?: string,
   ): Promise<{ notModified: boolean, value?: unknown, etag?: string }> {
-    const res = await this.fetchImpl(`${this.baseUrl}/api/content${path}`, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${this.apiKey}`,
-        ...(ifNoneMatch ? { 'If-None-Match': ifNoneMatch } : {}),
-        ...this.headers,
-      },
-    })
+    const url = `${this.baseUrl}/api/content${path}`
+    return withTimeout(url, this.timeout, async (signal) => {
+      const res = await this.fetchImpl(url, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          ...(ifNoneMatch ? { 'If-None-Match': ifNoneMatch } : {}),
+          ...this.headers,
+        },
+        signal,
+      })
 
-    if (res.status === 304) return { notModified: true, etag: res.headers.get('etag') ?? ifNoneMatch ?? undefined }
-    if (!res.ok) throw await this.toError(res)
-    const etag = res.headers.get('etag') ?? undefined
-    if (res.status === 204) return { notModified: false, value: undefined, etag }
-    return { notModified: false, value: await res.json(), etag }
+      if (res.status === 304) return { notModified: true, etag: res.headers.get('etag') ?? ifNoneMatch ?? undefined }
+      if (!res.ok) throw await this.toError(res)
+      const etag = res.headers.get('etag') ?? undefined
+      if (res.status === 204) return { notModified: false, value: undefined, etag }
+      return { notModified: false, value: await res.json(), etag }
+    })
   }
 
-  private async request<T>(method: Method, path: string, body?: unknown): Promise<T> {
-    const res = await this.fetchImpl(`${this.baseUrl}/api/content${path}`, {
-      method,
-      headers: {
-        Authorization: `Bearer ${this.apiKey}`,
-        ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
-        ...this.headers,
-      },
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-    })
+  private async request<T>(method: Method, path: string, body?: unknown, timeout = this.timeout): Promise<T> {
+    const url = `${this.baseUrl}/api/content${path}`
+    return withTimeout(url, timeout, async (signal) => {
+      const res = await this.fetchImpl(url, {
+        method,
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+          ...this.headers,
+        },
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal,
+      })
 
-    if (!res.ok) throw await this.toError(res)
-    if (res.status === 204) return undefined as T
-    return res.json() as Promise<T>
+      if (!res.ok) throw await this.toError(res)
+      if (res.status === 204) return undefined as T
+      return (await res.json()) as T
+    })
   }
 
   /** Parse a non-2xx response into a `JustmadeError`, preferring its message. */
@@ -498,6 +529,39 @@ export function isPreviewRequest(input: PreviewInput): boolean {
     return isPreviewRequest((input as { url: string }).url)
   }
   return Object.prototype.hasOwnProperty.call(input, PREVIEW_PARAM)
+}
+
+// ── Timeout ───────────────────────────────────────────────────────────────────
+
+/**
+ * Runs `run` with an abort signal that fires after `ms`, and rejects with a
+ * `TimeoutError` at that moment whether or not `run` listens to the signal: a
+ * custom `fetch` may ignore it. The timer spans the whole of `run`, so a studio
+ * that sends headers and then stalls the body is caught too.
+ *
+ * The error is a plain `Error`, not a `JustmadeError`: the read path treats
+ * anything without an HTTP status as transient and serves the cache.
+ */
+async function withTimeout<T>(url: string, ms: number, run: (signal?: AbortSignal) => Promise<T>): Promise<T> {
+  if (ms <= 0) return run(undefined)
+
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`Justmade Studio did not answer within ${ms}ms: ${url}`)
+      err.name = 'TimeoutError'
+      controller.abort(err)
+      reject(err)
+    }, ms)
+  })
+
+  try {
+    return await Promise.race([run(controller.signal), expired])
+  }
+  finally {
+    clearTimeout(timer)
+  }
 }
 
 // ── Cache-key + path helpers ──────────────────────────────────────────────────

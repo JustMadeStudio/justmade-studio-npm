@@ -16,12 +16,20 @@
 
 export type VersionProbe = () => Promise<string>
 
+/** How long a `404` from the version route silences the check. */
+export const UNSUPPORTED_PAUSE_MS = 15 * 60_000
+
 export class VersionTracker {
     private lastChecked = 0
     private version: string | null = null
     private inFlight: Promise<void> | null = null
-    /** Set when the server has no version route, so we stop asking. */
-    private unsupported = false
+    /**
+     * Epoch ms before which we do not ask again, after the route answered `404`.
+     * A pause and not a final verdict: an old server without the route costs
+     * one request per pause, while a proxy or maintenance page that answers 404
+     * for a moment would otherwise switch freshness off until a restart.
+     */
+    private pausedUntil = 0
 
     constructor(
         private readonly probe: VersionProbe,
@@ -40,12 +48,12 @@ export class VersionTracker {
      * last known stamp in place (serve-from-cache rather than thrash).
      */
     async refresh(now: number): Promise<void> {
-        if (this.interval <= 0 || this.unsupported) return
+        if (this.interval <= 0 || now < this.pausedUntil) return
         if (this.inFlight) return this.inFlight
         if (this.version !== null && now - this.lastChecked < this.interval) return
 
         this.lastChecked = now
-        this.inFlight = this.run()
+        this.inFlight = this.run(now)
         try {
             await this.inFlight
         }
@@ -54,15 +62,17 @@ export class VersionTracker {
         }
     }
 
-    private async run(): Promise<void> {
+    private async run(now: number): Promise<void> {
         try {
             this.version = await this.probe()
         }
         catch (err) {
-            // A server that predates the version route will never answer; stop
-            // asking. Any other failure is transient - keep the last stamp so the
-            // cache keeps serving, and try again next interval.
-            if ((err as { status?: number })?.status === 404) this.unsupported = true
+            // A server that predates the version route answers 404: ask again
+            // only after a long pause. Any other failure is transient - keep the
+            // last stamp so the cache keeps serving, and try again next interval.
+            if ((err as { status?: number })?.status === 404) {
+                this.pausedUntil = now + Math.max(this.interval, UNSUPPORTED_PAUSE_MS)
+            }
         }
     }
 }

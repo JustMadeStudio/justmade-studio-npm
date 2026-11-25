@@ -1,7 +1,8 @@
 import { defineConfig } from 'tsup'
 
 export default defineConfig({
-  entry: ['src/index.ts'],
+  // `file-store` is its own entry: it imports node:fs, the main one stays browser-safe.
+  entry: ['src/index.ts', 'src/file-store.ts'],
   format: ['esm', 'cjs'],
   dts: true,
   clean: true,

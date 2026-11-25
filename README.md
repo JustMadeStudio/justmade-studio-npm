@@ -11,6 +11,8 @@ a fully typed client with built-in read caching.
 - Zero dependencies, works in Node 18+ and the browser (the API sends permissive CORS).
 - Dual ESM / CommonJS build, full TypeScript types.
 - Read caching with TTL, automatic invalidation on writes, and a `clearCache()` method.
+- Keeps serving the last good content through a studio outage, and with
+  `FileCacheStore` through a restart during one.
 
 ## Install
 
@@ -178,6 +180,11 @@ What this buys you:
   `cache: false` read, which never falls back. After a failed attempt an
   entry waits one `revalidate` interval (1 minute if revalidation is off)
   before trying again, so reads don't each wait on the unreachable studio.
+- **A studio that hangs** (accepts the connection, never answers) counts as
+  unreachable too: every request gives up after `timeout` (10 seconds by
+  default, body included), the stamp check after at most 3 seconds.
+- A `404` from the stamp route (an older server, or a proxy page in front of
+  the studio) pauses the stamp check for 15 minutes; it then tries again.
 - The **TTL (7 days default)** is not the refresh interval either: it is how
   long an entry is served without asking the studio when the stamp gives no
   reason to. After that the next read refetches it (a `304` if nothing
@@ -204,6 +211,9 @@ createClient({ apiKey, baseUrl, cache: false })
 
 // Bypass the cache for a single call (the fresh value still refreshes it):
 await studio.listRecords('blog', 'posts', { cache: false })
+
+// Give up on a request sooner (default 10s; 0 = wait as long as the runtime does):
+createClient({ apiKey, baseUrl, timeout: 5_000 })
 ```
 
 > Caching is safe to leave on everywhere, including local/dev frontends: because
@@ -252,8 +262,36 @@ studio.clearCache({ node: 'blog', dataset: 'posts' }) // one dataset
 studio.dataset('blog', 'posts').clearCache()      // same, fluent
 ```
 
-Bring your own store (share a cache across instances, or persist it) by
-implementing `CacheStore` and passing it as `cache.store`.
+### Surviving a restart
+
+The default store lives in memory, so a process that restarts or redeploys
+while the studio is down starts with nothing to fall back on. On Node,
+`FileCacheStore` writes every entry through to disk and reads them back when it
+is created:
+
+```ts
+import { createClient } from '@justmade/client'
+import { FileCacheStore } from '@justmade/client/file-store'
+
+const studio = createClient({
+  apiKey,
+  cache: { store: new FileCacheStore({ dir: '/data/studio-cache' }) },
+})
+```
+
+- Put `dir` on a volume that survives a redeploy (a container's temp dir does not).
+- One directory per site: cache keys do not include the project or the key, so
+  two sites sharing one would show each other's content during an outage.
+- Reads are served from memory; the disk is only written on a change. A
+  directory that cannot be written leaves the store working from memory, with
+  one warning (or your own `onError`).
+- `maxEntries` (default 500) evicts the oldest entries, on disk too.
+
+It is a separate entry point because it imports `node:fs`; the main package
+stays usable in the browser.
+
+Bring your own store (share a cache across instances, or keep it somewhere
+else) by implementing `CacheStore` and passing it as `cache.store`.
 
 ## API
 

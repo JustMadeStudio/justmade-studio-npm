@@ -1,6 +1,6 @@
 {
   "name": "@justmade/client",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Typed client for the Justmade Studio content API. Read and write project node datasets from any website or app, headless-CMS style and beyond.",
   "type": "module",
   "publishConfig": {
@@ -15,6 +15,11 @@
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
     },
+    "./file-store": {
+      "types": "./dist/file-store.d.ts",
+      "import": "./dist/file-store.js",
+      "require": "./dist/file-store.cjs"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -26,6 +31,7 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -51,6 +57,7 @@
     "node": ">=18"
   },
   "devDependencies": {
+    "@types/node": "^18.19.130",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3"
   },
