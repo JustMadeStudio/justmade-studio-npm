@@ -8,7 +8,7 @@ surface (`/api/content/*`). A **project API key** (`slk_...`) grants read and/or
 write access to specific nodes and datasets. This package wraps that surface in
 a fully typed client with built-in read caching.
 
-- Zero dependencies, works in Node 18+ and the browser (the API sends permissive CORS).
+- Zero dependencies, works in Node 22+ and the browser (the API sends permissive CORS).
 - Dual ESM / CommonJS build, full TypeScript types.
 - Read caching with TTL, automatic invalidation on writes, and a `clearCache()` method.
 - Keeps serving the last good content through a studio outage, and with

@@ -54,7 +54,7 @@
   },
   "homepage": "https://github.com/JustMadeStudio/justmade-studio-npm#readme",
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "devDependencies": {
     "@types/node": "^18.19.130",
